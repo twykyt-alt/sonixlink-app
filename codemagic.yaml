@@ -1,0 +1,33 @@
+workflows:
+  sonixlink-ios-device:
+    name: SonixLink iPhone and iPad build
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+
+    integrations:
+      app_store_connect: sonixlink_apple
+
+    environment:
+      xcode: latest
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: org.sonix.link.ios
+
+    scripts:
+      - name: Apply TestFlight signing profiles
+        script: xcode-project use-profiles
+      - name: Build signed iOS app
+        script: |
+          xcode-project build-ipa \
+            --project "$CM_BUILD_DIR/ios/SonixLink.xcodeproj" \
+            --scheme SonixLink
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.app
+
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
