@@ -108,7 +108,10 @@ struct Track: Identifiable, Hashable {
         for (i, value) in args.enumerated() { sqlite3_bind_text(stmt, Int32(i + 1), (value as NSString).utf8String, -1, nil) }
         var out: [Track] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            func col(_ n: Int32) -> String { sqlite3_column_text(stmt, n).map { String(cString: $0) } ?? "" }
+            func col(_ n: Int32) -> String {
+                guard let text=sqlite3_column_text(stmt,n) else { return "" }
+                return String(cString:UnsafeRawPointer(text).assumingMemoryBound(to:CChar.self))
+            }
             out.append(Track(title: col(0), artist: col(1), album: col(2), path: col(3), filter: col(4), kind: col(5)))
         }
         return out
