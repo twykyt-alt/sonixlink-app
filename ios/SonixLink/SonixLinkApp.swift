@@ -250,7 +250,13 @@ struct Track: Identifiable, Hashable {
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         commandChar = service.characteristics?.first(where: {$0.uuid == bleCommand})
         stateChar = service.characteristics?.first(where: {$0.uuid == bleState})
-        if let stateChar { p.readValue(for: stateChar) }; status = "BLE remote connected"
+        if let stateChar {
+            p.readValue(for: stateChar); timer?.invalidate()
+            timer=Timer.scheduledTimer(withTimeInterval:1.5,repeats:true) { [weak p,weak self] _ in
+                guard let self, let p, let c=self.stateChar else{return}; p.readValue(for:c)
+            }
+        }
+        status = "BLE remote connected"
     }
     func peripheral(_ p: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard characteristic.uuid == bleState, let data=characteristic.value,
