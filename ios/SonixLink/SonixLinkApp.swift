@@ -28,6 +28,7 @@ struct Track: Identifiable, Hashable {
     @Published var queueFirst = 0
     @Published var queueRevision: Int64 = -1
     @Published var queuePosition = -1
+    @Published var queueCount = 0
     @Published var title = ""
     @Published var artist = ""
     @Published var playing = false
@@ -186,6 +187,7 @@ struct Track: Identifiable, Hashable {
     func play(_ row: Track) async {
         await command("play_path", ["path":row.path,"list":listKind,"value":listValue])
     }
+    func playAll(_ how: String) async { await command("play_all",["list":listKind,"value":listValue,"how":how]) }
 
     func command(_ action: String, _ args: [String: String] = [:]) async {
         if !base.isEmpty {
@@ -219,6 +221,7 @@ struct Track: Identifiable, Hashable {
             queueFirst = j["first"] as? Int ?? 0
             queueRevision = (j["revision"] as? NSNumber)?.int64Value ?? -1
             queuePosition = j["position"] as? Int ?? -1
+            queueCount = j["count"] as? Int ?? 0
             let paths = j["paths"] as? [String] ?? []; queue = paths.map { p in query("SELECT name,artist,album,path,'','track' FROM MEDIA_TABLE WHERE path=? LIMIT 1", [p]).first ?? Track(title: URL(fileURLWithPath:p).lastPathComponent, artist:"", path:p) }
             if let h=try? await request("/api/history?limit=100"), let hj=try? JSONSerialization.jsonObject(with:h) as? [String:Any] {
                 history=(hj["items"] as? [[String:Any]] ?? []).compactMap { x in guard let p=x["path"] as? String else{return nil}; return Track(title:x["title"] as? String ?? URL(fileURLWithPath:p).lastPathComponent,artist:x["artist"] as? String ?? "",path:p,filter:String(x["id"] as? Int ?? 0),kind:"history") }
@@ -236,6 +239,11 @@ struct Track: Identifiable, Hashable {
         if local < destination { to -= 1 }
         guard from > queuePosition, to > queuePosition, from != to else { return }
         await command("queue_move",["from":"\(from)","to":"\(to)","rev":"\(queueRevision)"])
+        await refreshQueue()
+    }
+    func insertHistory(_ item: Track) async {
+        let slot=max(queuePosition+1,0)
+        await command("history_insert",["id":item.filter,"at":"\(slot)","rev":"\(queueRevision)"])
         await refreshQueue()
     }
 
@@ -285,9 +293,9 @@ struct SonixRoot: View {
     var browse: some View {
         VStack(spacing:0) { connectBar; Text(app.status).font(.caption).foregroundStyle(.secondary); ScrollView(.horizontal) { HStack { ForEach(tabs,id:\.self) { t in Button(t) { app.selectTab(t) }.buttonStyle(.borderedProminent).tint(app.tab == t ? .accentColor : .gray) } }.padding(8) }
             List(app.rows) { row in Button { app.open(row) } label: { HStack { if row.kind == "track" { AsyncImage(url:URL(string:"http://\(app.host):7800/api/art?path=\(row.path.addingPercentEncoding(withAllowedCharacters:.urlQueryAllowed) ?? "")&max=96")) { image in image.resizable().scaledToFill() } placeholder: { Image(systemName:"music.note") }.frame(width:48,height:48).clipShape(RoundedRectangle(cornerRadius:5)) }; VStack(alignment:.leading) { Text(row.title); Text(row.artist.isEmpty ? row.album : row.artist).font(.caption).foregroundStyle(.secondary) }; Spacer(); if row.kind != "track" { Text(row.filter.isEmpty ? "" : row.kind).font(.caption).foregroundStyle(.secondary) } } }.contextMenu { if row.kind == "track" { Button("Play") { Task { await app.play(row) } }; Button("Add to queue") { Task { await app.selection("queue_next",paths:[row.path]) } }; Button("Favourite") { Task { await app.command("favourite",["path":row.path]) } }; if !app.playlistNames.isEmpty { Menu("Add to playlist") { ForEach(app.playlistNames,id:\.self) { name in Button(name) { Task { await app.selection("playlist_add",paths:[row.path],value:name) } } } } } } } }
-        }.navigationTitle(app.tab == "Folders" && !app.folderPath.isEmpty ? URL(fileURLWithPath:app.folderPath).lastPathComponent : app.tab).toolbar { if app.tab == "Folders" && !app.folderPath.isEmpty { Button("Up") { let parent=URL(fileURLWithPath:app.folderPath).deletingLastPathComponent().path; Task { await app.loadFolder(parent == "/" ? "" : parent) } } }; Button("Sync") { Task { await app.syncLibrary() } } }
+        }.navigationTitle(app.tab == "Folders" && !app.folderPath.isEmpty ? URL(fileURLWithPath:app.folderPath).lastPathComponent : app.tab).toolbar { if app.tab == "Folders" && !app.folderPath.isEmpty { Button("Up") { let parent=URL(fileURLWithPath:app.folderPath).deletingLastPathComponent().path; Task { await app.loadFolder(parent == "/" ? "" : parent) } } }; Menu("Play list") { Button("In order") { Task { await app.playAll("sequence") } }; Button("Shuffle") { Task { await app.playAll("shuffle") } }; Button("Play a random track next") { Task { await app.playAll("random") } } }; Button("Sync") { Task { await app.syncLibrary() } } }
     }
     var searchView: some View { VStack { connectBar; TextField("Search tracks, artists, albums",text:$app.search).textFieldStyle(.roundedBorder).padding().onChange(of:app.search) { _ in app.loadRows() }; List(app.rows) { row in Button { app.open(row) } label: { VStack(alignment:.leading){Text(row.title);Text(row.artist).font(.caption).foregroundStyle(.secondary)} } } }.navigationTitle("Search") }
-    var queueView: some View { List { Section("Queue") { ForEach(Array(app.queue.enumerated()),id:\.offset) { i,row in Button { Task { await app.command("queue_index",["value":"\(app.queueFirst+i)"]) } } label: { HStack { Text("\(app.queueFirst+i+1)").foregroundStyle(.secondary); VStack(alignment:.leading){Text(row.title);Text(row.artist).font(.caption).foregroundStyle(.secondary)} } } }.onDelete { offsets in Task { await app.removeQueueRows(offsets) } }.onMove { source,destination in Task { await app.moveQueueRow(from:source,to:destination) } } }; Section("Recently played") { ForEach(app.history) { item in Button { Task { await app.command("history_play",["id":item.filter]) } } label: { VStack(alignment:.leading) { Text(item.title); Text(item.artist).font(.caption).foregroundStyle(.secondary) } } } } }.navigationTitle("Queue").toolbar { EditButton(); Button("Refresh") { Task { await app.refreshQueue() } } } }
+    var queueView: some View { List { Section("Queue") { ForEach(Array(app.queue.enumerated()),id:\.offset) { i,row in Button { Task { await app.command("queue_index",["value":"\(app.queueFirst+i)"]) } } label: { HStack { Text("\(app.queueFirst+i+1)").foregroundStyle(.secondary); VStack(alignment:.leading){Text(row.title);Text(row.artist).font(.caption).foregroundStyle(.secondary)} } } }.onDelete { offsets in Task { await app.removeQueueRows(offsets) } }.onMove { source,destination in Task { await app.moveQueueRow(from:source,to:destination) } } }; Section("Recently played") { ForEach(app.history) { item in Button { Task { await app.command("history_play",["id":item.filter]) } } label: { VStack(alignment:.leading) { Text(item.title); Text(item.artist).font(.caption).foregroundStyle(.secondary) } }.contextMenu { Button("Play next") { Task { await app.command("history_play",["id":item.filter]) } }; Button("Insert after current") { Task { await app.insertHistory(item) } } } } } }.navigationTitle("Queue · \(app.queueCount)").toolbar { EditButton(); Button("Refresh") { Task { await app.refreshQueue() } } } }
     var playerView: some View { VStack(spacing:20) { connectBar; Spacer(); if !app.nowPlayingPath.isEmpty { AsyncImage(url:URL(string:"http://\(app.host):7800/api/art?path=\(app.nowPlayingPath.addingPercentEncoding(withAllowedCharacters:.urlQueryAllowed) ?? "")&max=640")) { $0.resizable().scaledToFit() } placeholder: { RoundedRectangle(cornerRadius:12).fill(.quaternary).overlay(Image(systemName:"music.note").font(.largeTitle)) }.frame(maxHeight:300).clipShape(RoundedRectangle(cornerRadius:12)) }; Text(app.title.isEmpty ? "Nothing playing" : app.title).font(.title2.bold()).multilineTextAlignment(.center); Text(app.artist).foregroundStyle(.secondary); Slider(value:Binding(get:{Double(app.position)},set:{app.position=Int($0);Task{await app.command("seek",["value":"\(Int($0))"])}}),in:0...Double(max(app.duration,1))); HStack { Button { Task{await app.command("prev")} } label:{Image(systemName:"backward.end.fill")}; Button { Task{await app.command(app.playing ? "pause":"play")} } label:{Image(systemName:app.playing ? "pause.fill":"play.fill")}.font(.largeTitle); Button { Task{await app.command("next")} } label:{Image(systemName:"forward.end.fill")} }.buttonStyle(.bordered); HStack { Image(systemName:"speaker.fill"); Slider(value:Binding(get:{Double(app.volume)},set:{app.volume=Int($0);Task{await app.command("volume",["value":"\(Int($0))"])}}),in:0...100) }; HStack { Button(app.favourite ? "★ In favourites":"☆ Favourite") { Task{await app.command("favourite",["path":app.nowPlayingPath])} }; Menu("Mode: \(app.mode)") { ForEach(["normal","repeat_all","repeat_one","shuffle","shuffle_repeat"],id:\.self) { m in Button(m.replacingOccurrences(of:"_",with:" ")) { Task{await app.command("mode",["value":m])} } } } }; Spacer() }.padding().navigationTitle("Now Playing") }
 }
