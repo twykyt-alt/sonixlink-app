@@ -1,6 +1,6 @@
 import SwiftUI
 import Combine
-import CoreBluetooth
+@preconcurrency import CoreBluetooth
 import SQLite3
 
 private let bleService = CBUUID(string: "D54B0001-6B7D-4D13-A2F1-91F9B5D89001")
@@ -17,8 +17,9 @@ struct Track: Identifiable, Hashable {
     var kind: String = "track"
 }
 
-@MainActor final class Sonix: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+@MainActor final class Sonix: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate, NetServiceBrowserDelegate, NetServiceDelegate {
     @Published var host = UserDefaults.standard.string(forKey: "sonix.host") ?? ""
+    @Published var port = 7800
     @Published var status = "Enter the R1 address, or connect over BLE"
     @Published var tab = "Tracks"
     @Published var rows: [Track] = []
@@ -47,17 +48,30 @@ struct Track: Identifiable, Hashable {
     private var commandChar: CBCharacteristic?
     private var stateChar: CBCharacteristic?
     private var timer: Timer?
+    private let browser = NetServiceBrowser()
     private var listKind = "all"
     private var listValue = ""
 
-    override init() { super.init(); central = CBCentralManager(delegate: self, queue: .main) }
+    override init() {
+        super.init(); central = CBCentralManager(delegate: self, queue: .main)
+        browser.delegate = self; browser.searchForServices(ofType: "_sonixlink._tcp.", inDomain: "local.")
+    }
     deinit { if let db { sqlite3_close(db) } }
 
     func connect() {
         let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !h.isEmpty else { error = "Enter the player's IP address"; return }
-        host = h; UserDefaults.standard.set(h, forKey: "sonix.host"); base = "http://\(h):7800"
+        host = h; UserDefaults.standard.set(h, forKey: "sonix.host"); base = "http://\(h):\(port)"
         Task { await syncLibrary() }
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
+        service.delegate = self; service.resolve(withTimeout: 5)
+    }
+    func netServiceDidResolveAddress(_ sender: NetService) {
+        guard let name=sender.hostName, !name.isEmpty, base.isEmpty else { return }
+        host = name.trimmingCharacters(in: CharacterSet(charactersIn:".")); port = sender.port
+        connect()
     }
 
     private func request(_ route: String, method: String = "GET", body: Data? = nil) async throws -> Data {
@@ -116,6 +130,12 @@ struct Track: Identifiable, Hashable {
         case "Genres": rows = query("SELECT genre,'','',genre,'genre','genre' FROM GENRE_TABLE WHERE genre<>'' ORDER BY sortkey,genre")
         default: rows = query("SELECT name,artist,album,path,'','track' FROM MEDIA_TABLE WHERE path<>'' ORDER BY sortkey,rowid LIMIT 10000")
         }
+    }
+
+    func selectTab(_ name: String) {
+        tab=name; search=""; listValue=""
+        switch name { case "Albums": listKind="albums"; case "Artists": listKind="artist"; case "Album Artists": listKind="album_artist"; case "Genres": listKind="genre"; case "Playlists": listKind="playlist"; case "Favourites": listKind="favourites"; case "Folders": listKind="folder"; default: listKind="all" }
+        loadRows()
     }
 
     func loadFolder(_ path: String) async {
@@ -234,7 +254,7 @@ struct SonixRoot: View {
     }
     var connectBar: some View { HStack { TextField("R1 IP address",text:$app.host).keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled(); Button("Connect") { app.connect() }.disabled(app.busy) }.padding(.horizontal) }
     var browse: some View {
-        VStack(spacing:0) { connectBar; Text(app.status).font(.caption).foregroundStyle(.secondary); ScrollView(.horizontal) { HStack { ForEach(tabs,id:\.self) { t in Button(t) { app.tab=t; app.search=""; app.loadRows() }.buttonStyle(.borderedProminent).tint(app.tab == t ? .accentColor : .gray) } }.padding(8) }
+        VStack(spacing:0) { connectBar; Text(app.status).font(.caption).foregroundStyle(.secondary); ScrollView(.horizontal) { HStack { ForEach(tabs,id:\.self) { t in Button(t) { app.selectTab(t) }.buttonStyle(.borderedProminent).tint(app.tab == t ? .accentColor : .gray) } }.padding(8) }
             List(app.rows) { row in Button { app.open(row) } label: { HStack { if row.kind == "track" { AsyncImage(url:URL(string:"http://\(app.host):7800/api/art?path=\(row.path.addingPercentEncoding(withAllowedCharacters:.urlQueryAllowed) ?? "")&max=96")) { image in image.resizable().scaledToFill() } placeholder: { Image(systemName:"music.note") }.frame(width:48,height:48).clipShape(RoundedRectangle(cornerRadius:5)) }; VStack(alignment:.leading) { Text(row.title); Text(row.artist.isEmpty ? row.album : row.artist).font(.caption).foregroundStyle(.secondary) }; Spacer(); if row.kind != "track" { Text(row.filter.isEmpty ? "" : row.kind).font(.caption).foregroundStyle(.secondary) } } }.contextMenu { if row.kind == "track" { Button("Play") { Task { await app.play(row) } }; Button("Add to queue") { Task { await app.selection("queue_next",paths:[row.path]) } }; Button("Favourite") { Task { await app.command("favourite",["path":row.path]) } } } } }
         }.navigationTitle(app.tab == "Folders" && !app.folderPath.isEmpty ? URL(fileURLWithPath:app.folderPath).lastPathComponent : app.tab).toolbar { if app.tab == "Folders" && !app.folderPath.isEmpty { Button("Up") { let parent=URL(fileURLWithPath:app.folderPath).deletingLastPathComponent().path; Task { await app.loadFolder(parent == "/" ? "" : parent) } } }; Button("Sync") { Task { await app.syncLibrary() } } }
     }
