@@ -151,8 +151,34 @@ struct Track: Identifiable, Hashable {
         tab=name; search=""; listValue=""
         switch name { case "Albums": listKind="albums"; case "Artists": listKind="artist"; case "Album Artists": listKind="album_artist"; case "Genres": listKind="genre"; case "Playlists": listKind="playlist"; case "Favourites": listKind="favourites"; case "Folders": listKind="folder"; default: listKind="all" }
         loadRows()
+        if name == "Playlists" || name == "Favourites" { Task { await loadLiveRows(for: name) } }
     }
-    var playlistNames: [String] { query("SELECT substr(name,5),'','',substr(name,5),'playlist','playlist' FROM sqlite_master WHERE type='table' AND name LIKE 'M3U_%' ORDER BY name").map(\.title) }
+    var playlistNames: [String] { rowsForPlaylists.map(\.title) }
+    private var rowsForPlaylists: [Track] {
+        if tab == "Playlists" { return rows }
+        return query("SELECT substr(name,5),'','',substr(name,5),'playlist','playlist' FROM sqlite_master WHERE type='table' AND name LIKE 'M3U_%' ORDER BY name")
+    }
+
+    private func loadLiveRows(for name: String) async {
+        guard !base.isEmpty else { return }
+        do {
+            let route = name == "Favourites" ? "/api/favourites" : "/api/playlists"
+            let data = try await request(route)
+            let key = name == "Favourites" ? "favourites" : "playlists"
+            let items = (try JSONSerialization.jsonObject(with: data) as? [String: Any])?[key] as? [[String: Any]] ?? []
+            let result = items.compactMap { item -> Track? in
+                if name == "Favourites" {
+                    guard let path = item["path"] as? String, !path.isEmpty else { return nil }
+                    return Track(title: item["name"] as? String ?? URL(fileURLWithPath: path).lastPathComponent,
+                                 artist: item["artist"] as? String ?? "", path: path)
+                }
+                guard let title = item["name"] as? String, !title.isEmpty else { return nil }
+                return Track(title: title, artist: "", path: title, kind: "playlist")
+            }
+            guard tab == name else { return }
+            rows = result
+        } catch { self.error = error.localizedDescription }
+    }
 
     func loadFolder(_ path: String) async {
         guard !base.isEmpty else { return }
@@ -192,7 +218,7 @@ struct Track: Identifiable, Hashable {
     func command(_ action: String, _ args: [String: String] = [:]) async {
         if !base.isEmpty {
             var c = URLComponents(string: base + "/api/command")!; c.queryItems = [URLQueryItem(name: "do", value: action)] + args.map { URLQueryItem(name: $0.key, value: $0.value) }
-            do { var r = URLRequest(url: c.url!); r.httpMethod = "POST"; _ = try await URLSession.shared.data(for: r); await refreshState(); return }
+            do { var r = URLRequest(url: c.url!); r.httpMethod = "POST"; _ = try await URLSession.shared.data(for: r); await refreshState(); if action == "favourite", tab == "Favourites" { await loadLiveRows(for: "Favourites") }; return }
             catch { self.error = error.localizedDescription }
         }
         let op: UInt8? = ["play":0,"pause":1,"toggle":2,"next":3,"prev":4,"seek":5,"volume":6][action]
