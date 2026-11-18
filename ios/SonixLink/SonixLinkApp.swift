@@ -86,14 +86,24 @@ struct Track: Identifiable, Hashable {
         return data
     }
 
+    private func download(_ route: String, to destination: URL) async throws {
+        guard let url=URL(string:base+route) else { throw URLError(.badURL) }
+        var req=URLRequest(url:url,timeoutInterval:180); req.httpMethod="GET"
+        let (temporary,response)=try await URLSession.shared.download(for:req)
+        guard let http=response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw NSError(domain:"SonixLink",code:(response as? HTTPURLResponse)?.statusCode ?? -1,userInfo:[NSLocalizedDescriptionKey:"Could not download the library index"])
+        }
+        try? FileManager.default.removeItem(at:destination)
+        try FileManager.default.moveItem(at:temporary,to:destination)
+    }
+
     func syncLibrary() async {
         busy = true; error = ""
         defer { busy = false }
         do {
             _ = try await request("/api/info")
-            let data = try await request("/api/db")
             let file = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("library.db")
-            try data.write(to: file, options: .atomic)
+            try await download("/api/db",to:file)
             if let db { sqlite3_close(db); self.db = nil }
             guard sqlite3_open_v2(file.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { throw NSError(domain: "SonixLink", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not open the player's library"]) }
             status = "Connected to \(host)"; tab = "Tracks"; loadRows(); await refreshState(); await refreshQueue()
