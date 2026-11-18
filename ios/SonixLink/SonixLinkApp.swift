@@ -121,6 +121,7 @@ struct Track: Identifiable, Hashable {
         let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
         if tab == "Folders" { Task { await loadFolder(folderPath) }; return }
         if !q.isEmpty {
+            listKind="all"; listValue=""
             let like = "%" + q.replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%"
             rows = query("SELECT * FROM (SELECT name AS t,artist AS a,album AS b,path AS p,'' AS f,'track' AS k FROM MEDIA_TABLE WHERE path<>'' AND (name LIKE ? ESCAPE '\\' OR artist LIKE ? ESCAPE '\\' OR album LIKE ? ESCAPE '\\') UNION ALL SELECT album,'',album,album,'album','album' FROM ALBUM_TABLE WHERE album LIKE ? ESCAPE '\\' UNION ALL SELECT artist,'','',artist,'artist','artist' FROM ARTIST_TABLE WHERE artist LIKE ? ESCAPE '\\') ORDER BY t LIMIT 500", [like,like,like,like,like]); return
         }
@@ -169,7 +170,7 @@ struct Track: Identifiable, Hashable {
             Task { do { var c=URLComponents(string:base+"/api/playlist")!; c.queryItems=[URLQueryItem(name:"name",value:row.title)]; let d=try await request(c.url!.absoluteString.replacingOccurrences(of:base,with:"")); let j=try JSONSerialization.jsonObject(with:d) as? [String:Any] ?? [:]; rows=(j["tracks"] as? [[String:Any]] ?? []).compactMap { x in guard let p=x["path"] as? String else{return nil}; return Track(title:x["title"] as? String ?? URL(fileURLWithPath:p).lastPathComponent,artist:x["artist"] as? String ?? "",path:p) } } catch { self.error=error.localizedDescription } }
         default: break
         }
-        tab = row.title
+        if row.kind != "folder" { tab = row.title }
     }
 
     func play(_ row: Track) async {
@@ -217,7 +218,7 @@ struct Track: Identifiable, Hashable {
     func removeQueueRows(_ offsets: IndexSet) async {
         let indices = offsets.map { queueFirst + $0 }.filter { queuePosition < 0 || $0 > queuePosition }
         guard !indices.isEmpty, queueRevision >= 0, !base.isEmpty else { return }
-        do { var c=URLComponents(string:base+"/api/command")!; c.queryItems=[URLQueryItem(name:"do",value:"queue_remove"),URLQueryItem(name:"rev",value:"\(queueRevision)")]; var r=URLRequest(url:c.url!); r.httpMethod="POST"; r.httpBody=Data(indices.map(String.init).joined(separator:"\n").utf8); r.setValue("text/plain; charset=utf-8",forHTTPHeaderField:"Content-Type"); _=try await URLSession.shared.data(for:r); await refreshQueue() } catch { self.error=error.localizedDescription }
+        do { var c=URLComponents(string:base+"/api/command")!; c.queryItems=[URLQueryItem(name:"do",value:"queue_remove"),URLQueryItem(name:"rev",value:"\(queueRevision)")]; var r=URLRequest(url:c.url!); r.httpMethod="POST"; r.httpBody=Data(indices.map { String($0) }.joined(separator:"\n").utf8); r.setValue("text/plain; charset=utf-8",forHTTPHeaderField:"Content-Type"); _=try await URLSession.shared.data(for:r); await refreshQueue() } catch { self.error=error.localizedDescription }
     }
     func moveQueueRow(from source: IndexSet, to destination: Int) async {
         guard let local=source.first, queueRevision >= 0 else { return }
