@@ -14,6 +14,17 @@
     <true />
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>Connect to your Sonix player to control playback without Wi-Fi.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Connect to Sonix Player on your local network to browse and control your music library.</string>
+    <key>NSBonjourServices</key>
+    <array>
+      <string>_sonixlink._tcp</string>
+    </array>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+      <key>NSAllowsArbitraryLoads</key>
+      <true />
+    </dict>
     <key>UIApplicationSceneManifest</key>
     <dict>
       <key>UIApplicationSupportsMultipleScenes</key>

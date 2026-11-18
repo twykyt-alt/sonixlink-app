@@ -1,137 +1,232 @@
 import SwiftUI
 import Combine
-@preconcurrency import CoreBluetooth
+import CoreBluetooth
+import SQLite3
 
-@main
-struct SonixLinkApp: App {
-    var body: some Scene { WindowGroup { RemoteView() } }
+private let bleService = CBUUID(string: "D54B0001-6B7D-4D13-A2F1-91F9B5D89001")
+private let bleState = CBUUID(string: "D54B0002-6B7D-4D13-A2F1-91F9B5D89001")
+private let bleCommand = CBUUID(string: "D54B0003-6B7D-4D13-A2F1-91F9B5D89001")
+
+struct Track: Identifiable, Hashable {
+    var id: String { path }
+    var title: String
+    var artist: String
+    var album: String = ""
+    var path: String
+    var filter: String = ""
+    var kind: String = "track"
 }
 
-private let serviceID = CBUUID(string: "D54B0001-6B7D-4D13-A2F1-91F9B5D89001")
-private let stateID   = CBUUID(string: "D54B0002-6B7D-4D13-A2F1-91F9B5D89001")
-private let commandID = CBUUID(string: "D54B0003-6B7D-4D13-A2F1-91F9B5D89001")
-
-@MainActor
-final class BLERemote: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
-    @Published var status = "Searching for SonixOS"
+@MainActor final class Sonix: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+    @Published var host = UserDefaults.standard.string(forKey: "sonix.host") ?? ""
+    @Published var status = "Enter the R1 address, or connect over BLE"
+    @Published var tab = "Tracks"
+    @Published var rows: [Track] = []
+    @Published var queue: [Track] = []
+    @Published var queueFirst = 0
+    @Published var queueRevision: Int64 = -1
+    @Published var queuePosition = -1
     @Published var title = ""
     @Published var artist = ""
     @Published var playing = false
     @Published var position = 0
     @Published var duration = 0
     @Published var volume = 50
-
+    @Published var search = ""
+    @Published var folderPath = ""
+    @Published var busy = false
+    @Published var error = ""
+    private var db: OpaquePointer?
+    private var base = ""
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
-    private var stateCharacteristic: CBCharacteristic?
-    private var commandCharacteristic: CBCharacteristic?
-    private var poll: Timer?
+    private var commandChar: CBCharacteristic?
+    private var stateChar: CBCharacteristic?
+    private var timer: Timer?
+    private var listKind = "all"
+    private var listValue = ""
 
-    override init() {
-        super.init()
-        central = CBCentralManager(delegate: self, queue: .main,
-                                   options: [CBCentralManagerOptionRestoreIdentifierKey: "org.sonix.link.central"])
+    override init() { super.init(); central = CBCentralManager(delegate: self, queue: .main) }
+    deinit { if let db { sqlite3_close(db) } }
+
+    func connect() {
+        let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !h.isEmpty else { error = "Enter the player's IP address"; return }
+        host = h; UserDefaults.standard.set(h, forKey: "sonix.host"); base = "http://\(h):7800"
+        Task { await syncLibrary() }
+    }
+
+    private func request(_ route: String, method: String = "GET", body: Data? = nil) async throws -> Data {
+        guard let url = URL(string: base + route) else { throw URLError(.badURL) }
+        var req = URLRequest(url: url, timeoutInterval: 30); req.httpMethod = method; req.httpBody = body
+        if body != nil { req.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type") }
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw NSError(domain: "SonixLink", code: (response as? HTTPURLResponse)?.statusCode ?? -1,
+                          userInfo: [NSLocalizedDescriptionKey: String(data: data, encoding: .utf8) ?? "Player request failed"])
+        }
+        return data
+    }
+
+    func syncLibrary() async {
+        busy = true; error = ""
+        defer { busy = false }
+        do {
+            _ = try await request("/api/info")
+            let data = try await request("/api/db")
+            let file = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("library.db")
+            try data.write(to: file, options: .atomic)
+            if let db { sqlite3_close(db); self.db = nil }
+            guard sqlite3_open_v2(file.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { throw NSError(domain: "SonixLink", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not open the player's library"]) }
+            status = "Connected to \(host)"; tab = "Tracks"; loadRows(); await refreshState(); await refreshQueue()
+            timer?.invalidate(); timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in Task { await self?.refreshState() } }
+        } catch { self.error = error.localizedDescription; status = "Could not connect" }
+    }
+
+    private func query(_ sql: String, _ args: [String] = []) -> [Track] {
+        guard let db else { return [] }; var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        for (i, value) in args.enumerated() { sqlite3_bind_text(stmt, Int32(i + 1), (value as NSString).utf8String, -1, nil) }
+        var out: [Track] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            func col(_ n: Int32) -> String { sqlite3_column_text(stmt, n).map { String(cString: $0) } ?? "" }
+            out.append(Track(title: col(0), artist: col(1), album: col(2), path: col(3), filter: col(4), kind: col(5)))
+        }
+        return out
+    }
+
+    func loadRows() {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        if tab == "Folders" { Task { await loadFolder(folderPath) }; return }
+        if !q.isEmpty {
+            let like = "%" + q.replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%"
+            rows = query("SELECT name,artist,album,path,'','track' FROM MEDIA_TABLE WHERE path<>'' AND (name LIKE ? ESCAPE '\\' OR artist LIKE ? ESCAPE '\\' OR album LIKE ? ESCAPE '\\') ORDER BY sortkey,name LIMIT 500", [like,like,like]); return
+        }
+        switch tab {
+        case "Albums": rows = query("SELECT album,'',album,album,'album','album' FROM ALBUM_TABLE WHERE album<>'' ORDER BY sortkey,album")
+        case "Artists": rows = query("SELECT artist,'','',artist,'artist','artist' FROM ARTIST_TABLE WHERE artist<>'' ORDER BY sortkey,artist")
+        case "Album Artists": rows = query("SELECT album_artist,'','',album_artist,'album_artist','album_artist' FROM ALBUM_ARTIST_TABLE WHERE album_artist<>'' ORDER BY sortkey,album_artist")
+        case "Favourites": rows = query("SELECT name,artist,'',path,'','track' FROM FAVOURITES ORDER BY added_at")
+        case "Playlists": rows = query("SELECT substr(name,5),'','',substr(name,5),'playlist','playlist' FROM sqlite_master WHERE type='table' AND name LIKE 'M3U_%' ORDER BY name")
+        case "Genres": rows = query("SELECT genre,'','',genre,'genre','genre' FROM GENRE_TABLE WHERE genre<>'' ORDER BY sortkey,genre")
+        default: rows = query("SELECT name,artist,album,path,'','track' FROM MEDIA_TABLE WHERE path<>'' ORDER BY sortkey,rowid LIMIT 10000")
+        }
+    }
+
+    func loadFolder(_ path: String) async {
+        guard !base.isEmpty else { return }
+        do {
+            var c=URLComponents(string:base+"/api/browse")!; c.queryItems=path.isEmpty ? nil : [URLQueryItem(name:"path",value:path)]
+            let data=try await request(c.url!.absoluteString.replacingOccurrences(of:base,with:""))
+            let j=try JSONSerialization.jsonObject(with:data) as? [String:Any] ?? [:]
+            folderPath=j["path"] as? String ?? path; listKind="folder"; listValue=folderPath
+            rows=(j["entries"] as? [[String:Any]] ?? []).compactMap { e in
+                guard let p=e["path"] as? String else{return nil}; let isDir=e["dir"] as? Bool ?? false
+                return Track(title:e["name"] as? String ?? URL(fileURLWithPath:p).lastPathComponent,artist:"",path:p,kind:isDir ? "folder" : "track")
+            }
+        } catch { self.error=error.localizedDescription }
+    }
+
+    func open(_ row: Track) {
+        if row.kind == "track" { Task { await command("play_path", ["path": row.path, "list": listKind, "value": listValue]) }; return }
+        switch row.kind {
+        case "folder": Task { await loadFolder(row.path) }
+        case "album": listKind="album"; listValue=row.title; rows = query("SELECT name,artist,album,path,'','track' FROM MEDIA_TABLE WHERE album=? AND path<>'' ORDER BY COALESCE(disc,1),dis_id,sortkey", [row.path])
+        case "artist": listKind="artist"; listValue=row.title; rows = query("SELECT name,album,album,path,'','track' FROM MEDIA_TABLE WHERE artist=? AND path<>'' ORDER BY sortkey", [row.path])
+        case "album_artist": listKind="album_artist"; listValue=row.title; rows = query("SELECT name,album,album,path,'','track' FROM MEDIA_TABLE WHERE album_artist=? AND path<>'' ORDER BY sortkey", [row.path])
+        case "genre": listKind="genre"; listValue=row.title; rows = query("SELECT name,artist,album,path,'','track' FROM MEDIA_TABLE WHERE genre=? AND path<>'' ORDER BY sortkey", [row.path])
+        case "playlist":
+            listKind="playlist"; listValue=row.title
+            Task { do { var c=URLComponents(string:base+"/api/playlist")!; c.queryItems=[URLQueryItem(name:"name",value:row.title)]; let d=try await request(c.url!.absoluteString.replacingOccurrences(of:base,with:"")); let j=try JSONSerialization.jsonObject(with:d) as? [String:Any] ?? [:]; rows=(j["tracks"] as? [[String:Any]] ?? []).compactMap { x in guard let p=x["path"] as? String else{return nil}; return Track(title:x["title"] as? String ?? URL(fileURLWithPath:p).lastPathComponent,artist:x["artist"] as? String ?? "",path:p) } } catch { self.error=error.localizedDescription } }
+        default: break
+        }
+        tab = row.title
+    }
+
+    func command(_ action: String, _ args: [String: String] = [:]) async {
+        if !base.isEmpty {
+            var c = URLComponents(string: base + "/api/command")!; c.queryItems = [URLQueryItem(name: "do", value: action)] + args.map { URLQueryItem(name: $0.key, value: $0.value) }
+            do { var r = URLRequest(url: c.url!); r.httpMethod = "POST"; _ = try await URLSession.shared.data(for: r); await refreshState(); return }
+            catch { self.error = error.localizedDescription }
+        }
+        let op: UInt8? = ["play":0,"pause":1,"toggle":2,"next":3,"prev":4,"seek":5,"volume":6][action]
+        if let op, let p = peripheral, let ch = commandChar {
+            var n = Int32(Int(args["value"] ?? "0") ?? 0).littleEndian
+            var d = Data([op]); withUnsafeBytes(of: &n) { d.append(contentsOf: $0) }; p.writeValue(d, for: ch, type: .withResponse)
+        }
+    }
+
+    func selection(_ action: String, paths: [String]) async {
+        guard !base.isEmpty, !paths.isEmpty else { return }
+        do { var c=URLComponents(string:base+"/api/command")!; c.queryItems=[URLQueryItem(name:"do",value:action)]; var r=URLRequest(url:c.url!); r.httpMethod="POST"; r.httpBody=Data(paths.joined(separator:"\n").utf8); r.setValue("text/plain; charset=utf-8",forHTTPHeaderField:"Content-Type"); _=try await URLSession.shared.data(for:r); await refreshQueue() } catch { self.error = error.localizedDescription }
+    }
+
+    private func refreshState() async {
+        guard !base.isEmpty else { return }
+        do { let data = try await request("/api/state"); let j = try JSONSerialization.jsonObject(with: data) as? [String:Any] ?? [:]
+            title = j["title"] as? String ?? ""; artist = j["artist"] as? String ?? ""; playing = (j["state"] as? Int) == 1
+            position = j["position"] as? Int ?? 0; duration = j["duration"] as? Int ?? 0; volume = j["volume"] as? Int ?? volume
+        } catch { }
+    }
+    func refreshQueue() async {
+        guard !base.isEmpty else { return }
+        do { let data = try await request("/api/queue"); let j = try JSONSerialization.jsonObject(with: data) as? [String:Any] ?? [:]
+            queueFirst = j["first"] as? Int ?? 0
+            queueRevision = (j["revision"] as? NSNumber)?.int64Value ?? -1
+            queuePosition = j["position"] as? Int ?? -1
+            let paths = j["paths"] as? [String] ?? []; queue = paths.map { p in query("SELECT name,artist,album,path,'','track' FROM MEDIA_TABLE WHERE path=? LIMIT 1", [p]).first ?? Track(title: URL(fileURLWithPath:p).lastPathComponent, artist:"", path:p) }
+        } catch { self.error = error.localizedDescription }
+    }
+    func removeQueueRows(_ offsets: IndexSet) async {
+        let indices = offsets.map { queueFirst + $0 }.filter { queuePosition < 0 || $0 > queuePosition }
+        guard !indices.isEmpty, queueRevision >= 0, !base.isEmpty else { return }
+        do { var c=URLComponents(string:base+"/api/command")!; c.queryItems=[URLQueryItem(name:"do",value:"queue_remove"),URLQueryItem(name:"rev",value:"\(queueRevision)")]; var r=URLRequest(url:c.url!); r.httpMethod="POST"; r.httpBody=Data(indices.map(String.init).joined(separator:"\n").utf8); r.setValue("text/plain; charset=utf-8",forHTTPHeaderField:"Content-Type"); _=try await URLSession.shared.data(for:r); await refreshQueue() } catch { self.error=error.localizedDescription }
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        guard central.state == .poweredOn else { status = "Bluetooth unavailable"; return }
-        status = "Searching for SonixOS"
-        central.scanForPeripherals(withServices: [serviceID])
+        if central.state == .poweredOn { status = "BLE ready — scan for SonixOS"; central.scanForPeripherals(withServices: [bleService]) }
     }
-
-    func centralManager(_ central: CBCentralManager, didDiscover p: CBPeripheral,
-                       advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        central.stopScan()
-        peripheral = p
-        p.delegate = self
-        status = "Connecting to \(p.name ?? "Sonix player")"
-        central.connect(p)
+    func centralManager(_ central: CBCentralManager, didDiscover p: CBPeripheral, advertisementData: [String:Any], rssi: NSNumber) {
+        central.stopScan(); peripheral = p; p.delegate = self; central.connect(p)
     }
-
-    func centralManager(_ central: CBCentralManager, didConnect p: CBPeripheral) {
-        status = "Connected"
-        p.discoverServices([serviceID])
-    }
-
-    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
-        poll?.invalidate(); poll = nil
-        stateCharacteristic = nil; commandCharacteristic = nil
-        status = "Disconnected — searching"
-        central.scanForPeripherals(withServices: [serviceID])
-    }
-
-    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
-        guard let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral])?.first else { return }
-        peripheral = restored
-        restored.delegate = self
-        status = "Reconnecting to \(restored.name ?? "Sonix player")"
-        central.connect(restored)
-    }
-
-    func centralManager(_ central: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        status = "Connection failed — searching"
-        central.scanForPeripherals(withServices: [serviceID])
-    }
-
-    func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let service = p.services?.first(where: { $0.uuid == serviceID }) else { return }
-        p.discoverCharacteristics([stateID, commandID], for: service)
-    }
-
+    func centralManager(_ central: CBCentralManager, didConnect p: CBPeripheral) { status = "BLE connected"; p.discoverServices([bleService]) }
+    func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) { p.services?.first(where: {$0.uuid == bleService}).map { p.discoverCharacteristics([bleState,bleCommand], for: $0) } }
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        for c in service.characteristics ?? [] {
-            if c.uuid == stateID { stateCharacteristic = c; p.readValue(for: c) }
-            if c.uuid == commandID { commandCharacteristic = c }
-        }
-        poll?.invalidate()
-        poll = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self, weak p] _ in
-            guard let self, let p, let c = self.stateCharacteristic else { return }
-            p.readValue(for: c)
-        }
+        commandChar = service.characteristics?.first(where: {$0.uuid == bleCommand})
+        stateChar = service.characteristics?.first(where: {$0.uuid == bleState})
+        if let stateChar { p.readValue(for: stateChar) }; status = "BLE remote connected"
     }
-
-    func peripheral(_ p: CBPeripheral, didUpdateValueFor c: CBCharacteristic, error: Error?) {
-        guard c.uuid == stateID, let data = c.value else { return }
-        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                title = obj["title"] as? String ?? ""
-                artist = obj["artist"] as? String ?? ""
-                playing = (obj["playing"] as? Bool) ?? false
-                position = obj["position"] as? Int ?? 0
-                duration = obj["duration"] as? Int ?? 0
-                volume = obj["volume"] as? Int ?? volume
-        }
-    }
-
-    func send(_ command: String, value: Int? = nil) {
-        guard let p = peripheral, let c = commandCharacteristic else { return }
-        let op: UInt8
-        switch command { case "play": op = 0; case "pause": op = 1; case "toggle": op = 2
-        case "next": op = 3; case "prev": op = 4; case "seek": op = 5; case "volume": op = 6
-        default: return }
-        var data = Data([op])
-        var arg = Int32(value ?? 0).littleEndian
-        withUnsafeBytes(of: &arg) { data.append(contentsOf: $0) }
-        p.writeValue(data, for: c, type: .withResponse)
+    func peripheral(_ p: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard characteristic.uuid == bleState, let data=characteristic.value,
+              let j=try? JSONSerialization.jsonObject(with:data) as? [String:Any] else { return }
+        title=j["title"] as? String ?? ""; artist=j["artist"] as? String ?? ""; playing=j["playing"] as? Bool ?? false
+        position=j["position"] as? Int ?? 0; duration=j["duration"] as? Int ?? 0; volume=j["volume"] as? Int ?? volume
     }
 }
 
-struct RemoteView: View {
-    @StateObject private var remote = BLERemote()
+@main struct SonixLinkApp: App {
+    var body: some Scene { WindowGroup { SonixRoot().environmentObject(Sonix()) } }
+}
+
+struct SonixRoot: View {
+    @EnvironmentObject var app: Sonix
+    private let tabs = ["Tracks","Albums","Artists","Album Artists","Genres","Playlists","Favourites","Folders"]
     var body: some View {
-        VStack(spacing: 18) {
-            Text("SonixLink").font(.largeTitle.bold())
-            Text(remote.status).font(.caption).foregroundStyle(.secondary)
-            Spacer()
-            Text(remote.title.isEmpty ? "Nothing playing" : remote.title).font(.title2.bold()).multilineTextAlignment(.center)
-            Text(remote.artist).foregroundStyle(.secondary)
-            Slider(value: Binding(get: { Double(remote.position) }, set: { remote.send("seek", value: Int($0)) }), in: 0...Double(max(remote.duration, 1)))
-            HStack {
-                Button { remote.send("prev") } label: { Image(systemName: "backward.end.fill") }
-                Button { remote.send(remote.playing ? "pause" : "play") } label: { Image(systemName: remote.playing ? "pause.fill" : "play.fill") }.font(.largeTitle)
-                Button { remote.send("next") } label: { Image(systemName: "forward.end.fill") }
-            }.buttonStyle(.bordered).font(.title2)
-            HStack { Image(systemName: "speaker.fill"); Slider(value: Binding(get: { Double(remote.volume) }, set: { remote.volume = Int($0); remote.send("volume", value: Int($0)) }), in: 0...100) }
-            Spacer()
-        }.padding(24)
+        TabView {
+            NavigationStack { browse }.tabItem { Label("Library", systemImage:"music.note.list") }
+            NavigationStack { searchView }.tabItem { Label("Search", systemImage:"magnifyingglass") }
+            NavigationStack { queueView }.tabItem { Label("Queue", systemImage:"text.line.first.and.arrowtriangle.forward") }
+            NavigationStack { playerView }.tabItem { Label("Playing", systemImage:"play.circle") }
+        }.alert("SonixLink", isPresented: Binding(get:{!app.error.isEmpty},set:{if !$0 {app.error=""}})) { Button("OK") { app.error="" } } message: { Text(app.error) }
     }
+    var connectBar: some View { HStack { TextField("R1 IP address",text:$app.host).keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled(); Button("Connect") { app.connect() }.disabled(app.busy) }.padding(.horizontal) }
+    var browse: some View {
+        VStack(spacing:0) { connectBar; Text(app.status).font(.caption).foregroundStyle(.secondary); ScrollView(.horizontal) { HStack { ForEach(tabs,id:\.self) { t in Button(t) { app.tab=t; app.search=""; app.loadRows() }.buttonStyle(.borderedProminent).tint(app.tab == t ? .accentColor : .gray) } }.padding(8) }
+            List(app.rows) { row in Button { app.open(row) } label: { HStack { if row.kind == "track" { AsyncImage(url:URL(string:"http://\(app.host):7800/api/art?path=\(row.path.addingPercentEncoding(withAllowedCharacters:.urlQueryAllowed) ?? "")&max=96")) { image in image.resizable().scaledToFill() } placeholder: { Image(systemName:"music.note") }.frame(width:48,height:48).clipShape(RoundedRectangle(cornerRadius:5)) }; VStack(alignment:.leading) { Text(row.title); Text(row.artist.isEmpty ? row.album : row.artist).font(.caption).foregroundStyle(.secondary) }; Spacer(); if row.kind != "track" { Text(row.filter.isEmpty ? "" : row.kind).font(.caption).foregroundStyle(.secondary) } } }.contextMenu { if row.kind == "track" { Button("Play") { Task { await app.command("play_path",["path":row.path,"list":app.tab.lowercased(),"value":""]) } }; Button("Add to queue") { Task { await app.selection("queue_next",paths:[row.path]) } }; Button("Favourite") { Task { await app.command("favourite",["path":row.path]) } } } } }
+        }.navigationTitle(app.tab == "Folders" && !app.folderPath.isEmpty ? URL(fileURLWithPath:app.folderPath).lastPathComponent : app.tab).toolbar { if app.tab == "Folders" && !app.folderPath.isEmpty { Button("Up") { let parent=URL(fileURLWithPath:app.folderPath).deletingLastPathComponent().path; Task { await app.loadFolder(parent == "/" ? "" : parent) } } }; Button("Sync") { Task { await app.syncLibrary() } } }
+    }
+    var searchView: some View { VStack { connectBar; TextField("Search tracks, artists, albums",text:$app.search).textFieldStyle(.roundedBorder).padding().onChange(of:app.search) { _ in app.loadRows() }; List(app.rows) { row in Button { app.open(row) } label: { VStack(alignment:.leading){Text(row.title);Text(row.artist).font(.caption).foregroundStyle(.secondary)} } } }.navigationTitle("Search") }
+    var queueView: some View { List { Section("Queue") { ForEach(Array(app.queue.enumerated()),id:\.offset) { i,row in Button { Task { await app.command("queue_index",["value":"\(app.queueFirst+i)"]) } } label: { HStack { Text("\(app.queueFirst+i+1)").foregroundStyle(.secondary); VStack(alignment:.leading){Text(row.title);Text(row.artist).font(.caption).foregroundStyle(.secondary)} } } }.onDelete { offsets in Task { await app.removeQueueRows(offsets) } } } }.navigationTitle("Queue").toolbar { Button("Refresh") { Task { await app.refreshQueue() } } } }
+    var playerView: some View { VStack(spacing:20) { connectBar; Spacer(); Text(app.title.isEmpty ? "Nothing playing" : app.title).font(.title2.bold()).multilineTextAlignment(.center); Text(app.artist).foregroundStyle(.secondary); Slider(value:Binding(get:{Double(app.position)},set:{app.position=Int($0);Task{await app.command("seek",["value":"\(Int($0))"])}}),in:0...Double(max(app.duration,1))); HStack { Button { Task{await app.command("prev")} } label:{Image(systemName:"backward.end.fill")}; Button { Task{await app.command(app.playing ? "pause":"play")} } label:{Image(systemName:app.playing ? "pause.fill":"play.fill")}.font(.largeTitle); Button { Task{await app.command("next")} } label:{Image(systemName:"forward.end.fill")} }.buttonStyle(.bordered); HStack { Image(systemName:"speaker.fill"); Slider(value:Binding(get:{Double(app.volume)},set:{app.volume=Int($0);Task{await app.command("volume",["value":"\(Int($0))"])}}),in:0...100) }; Spacer() }.padding().navigationTitle("Now Playing") }
 }

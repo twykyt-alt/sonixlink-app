@@ -1,0 +1,32 @@
+name: iOS simulator build
+
+on:
+  push:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build simulator app
+        run: >-
+          xcodebuild
+          -project ios/SonixLink.xcodeproj
+          -scheme SonixLink
+          -sdk iphonesimulator
+          -destination 'generic/platform=iOS Simulator'
+          CODE_SIGNING_ALLOWED=NO
+          build
+      - name: Package simulator app
+        run: |
+          APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -path '*/Build/Products/Debug-iphonesimulator/SonixLink.app' -print -quit)
+          test -n "$APP_PATH"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" SonixLink-Simulator.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SonixLink-iOS-simulator
+          path: SonixLink-Simulator.zip

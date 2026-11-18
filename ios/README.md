@@ -1,8 +1,8 @@
-# SonixLink iOS BLE remote
+# SonixLink for iOS
 
-Open `SonixLink.xcodeproj` in Xcode 15 or newer, select an iPhone destination, set your Apple development team under Signing & Capabilities, then build and run. The app scans for SonixOS's custom BLE service and exposes playback, seeking, and player-volume controls. It uses CoreBluetooth background mode for reconnects while iOS suspends the app.
+The iOS target includes library sync and browsing over the player's Wi-Fi API, local search, queue viewing/removal, playlists, folders, favourites, artwork, and playback/volume controls. Enter the R1's IP address in the app and tap **Connect**. It downloads the player's SQLite index and reads the player API on port 7800. The BLE service supplies playback controls and now-playing state when there is no Wi-Fi connection.
 
-On the R1, enable Bluetooth and turn on the **SonixLink** service in SonixOS settings. The service is local BLE: the iPhone must remain within Bluetooth range of the player; it does not provide control over the Internet. First connection should work without pairing because the GATT service is read/write and currently has no encryption requirement.
+On the R1, enable Bluetooth and turn on the **SonixLink** BLE service in SonixOS settings. BLE control works only within Bluetooth range. Full library sync and browsing currently use Wi-Fi; iOS cannot use Android's RFCOMM transport, so the BLE protocol needs more work before library browsing works without Wi-Fi.
 
 The wire format and UUIDs are documented in `Protocol.md`.
 
